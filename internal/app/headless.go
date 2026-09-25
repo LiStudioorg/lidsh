@@ -51,6 +51,12 @@ func RunHeadless(ctx context.Context, workdir, home string, args []string) error
 		SupportsThinking: true, // DeepSeek 形态
 	})
 
+	return runHeadlessCore(ctx, home, workdir, provider, model, prompt, adapter)
+}
+
+// runHeadlessCore 是 headless 的核心执行（可注入 adapter 以测试）：
+// 建会话 → 事件流 zstd 落盘 → 跑 agent → 最终回答写到 out。
+func runHeadlessCore(ctx context.Context, home, workdir, provider, model, prompt string, adapter llm.Adapter) error {
 	// 会话目录 & 持久化。
 	id := session.NewID()
 	dir := session.SessionDir(home, workdir, id)
