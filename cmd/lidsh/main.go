@@ -27,6 +27,7 @@ import (
 
 	"lidsh/internal/app"
 	"lidsh/internal/config"
+	"lidsh/internal/sandbox"
 )
 
 const usage = `lidsh — DeepSeek Harness (Go + Vue 3 reproduction)
@@ -135,6 +136,13 @@ func main() {
 }
 
 func run(argv []string) error {
+	// sandbox-exec 是沙箱 launcher 的内部子命令（等价 DSH 的 landlock-run
+	// 二进制），不进 launcher 文法：自限制后 exec 目标命令。仅供 Wrap 生成
+	// 的子进程 argv 使用，模型与用户均不可见。
+	if len(argv) > 0 && argv[0] == "sandbox-exec" {
+		return sandbox.HandleSandboxExec(argv[1:])
+	}
+
 	opts, err := parseLauncherArgs(argv)
 	if err != nil {
 		return err

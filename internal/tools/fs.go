@@ -18,9 +18,34 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"lidsh/internal/sandbox"
 )
 
 const grepMaxMatches = 250
+
+// fsWriteDenied 复刻 SandboxedFileSystem.checkedTarget（bash-sandbox.md §5.3）
+// 与 fs 工具错误映射（§4）：danger-full-access 直放；read-only 拒；workspace-write
+// 写前即时重新 canonicalize 目标后逐根 containment。
+// 返回空串=允许；非空=拒绝结果文本（marker + 升级 hint，isError）。
+func fsWriteDenied(sc *SandboxContext, path string) string {
+	if sc == nil || sc.Policy.Mode == sandbox.ModeDangerFullAccess {
+		return ""
+	}
+	if sc.Policy.Mode == sandbox.ModeReadOnly {
+		return sandbox.DenialMarker(sandbox.ModeReadOnly) + "\n" +
+			sandbox.EscalationHintMarker("operation")
+	}
+	// workspace-write：canonicalize-then-contain（§5.3）。
+	target := sandbox.CanonicalPath(path)
+	for _, root := range sc.Policy.WritableRoots() {
+		if sandbox.IsPathUnder(root, target) {
+			return ""
+		}
+	}
+	return sandbox.DenialMarker(sandbox.ModeWorkspaceWrite) + "\n" +
+		sandbox.EscalationHintMarker("operation")
+}
 
 // RegisterFSTools 注册全部 fs 工具族并返回批量注销函数。
 func RegisterFSTools(r *Registry) func() {
@@ -124,6 +149,10 @@ func RegisterFSWrite(r *Registry) func() {
 func execFSWrite(args map[string]any, ec *ExecContext) (*Result, error) {
 	path := resolvePath(ec, asString(anyLookup(args, "path")))
 	content := asString(anyLookup(args, "content"))
+	// M2：写 fence（§5.3 checkedTarget；拒绝文本=marker+hint，§4）。
+	if d := fsWriteDenied(ec.Sandbox, path); d != "" {
+		return &Result{Content: d, IsError: true}, nil
+	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return &Result{Content: "Error: " + err.Error(), IsError: true}, nil
 	}
@@ -194,6 +223,10 @@ func execFSEdit(args map[string]any, ec *ExecContext) (*Result, error) {
 
 	if count == 0 {
 		return &Result{Content: "Error: no match for old_string", IsError: true}, nil
+	}
+	// M2：写 fence（§5.3 checkedTarget；拒绝文本=marker+hint，§4）。
+	if d := fsWriteDenied(ec.Sandbox, path); d != "" {
+		return &Result{Content: d, IsError: true}, nil
 	}
 	if err := os.WriteFile(path, []byte(replacement), 0o644); err != nil {
 		return &Result{Content: "Error: " + err.Error(), IsError: true}, nil

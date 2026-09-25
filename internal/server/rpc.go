@@ -199,6 +199,7 @@ func (s *Server) runPrompt(ent *entry, text string) {
 			Reason:   s.Opts.Reason,
 			System:   s.Opts.System,
 			CWD:      ent.sess.Header.CWD,
+			Sandbox:  s.Opts.Sandbox,
 		})
 	}
 	a := ent.agent

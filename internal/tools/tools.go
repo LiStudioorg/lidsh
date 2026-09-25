@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"lidsh/internal/llm"
+	"lidsh/internal/sandbox"
 )
 
 // Definition 是发给模型的工具声明，同时是注册项（对应 DSH ToolDefinition）。
@@ -46,6 +47,44 @@ type ExecContext struct {
 	AgentCWD string          // agent 的会话 cwd
 	// CWD 是工具自身解析后的工作目录（bash 的 workdir 参数或 agent cwd）。
 	CWD string
+	// Sandbox 是本次调用的沙箱上下文；nil=未挂载 confinement executor
+	// （工具不感知沙箱，提权字段也不 advertise，bash-sandbox.md §6.1）。
+	Sandbox *SandboxContext
+}
+
+// SandboxContext 是挂载了沙箱的组合里，每次工具调用携带的沙箱裁决输入。
+type SandboxContext struct {
+	Policy    sandbox.Policy         // standing 策略（mode + workspaceRoot）
+	Runner    string                 // confinement runner（DetectRunner 结果）
+	Approver  sandbox.Approver       // 审批通道（nil=无通道，提权 fail-closed）
+	Approval  sandbox.ApprovalPolicy // ask | never
+	SessionID string                 // 发起 agent（=Session id）
+	CallID    string                 // 本次工具调用 id（审批载荷）
+}
+
+// ResolvePolicy 返回本调用生效策略：显式获批 mode 仅 stamp 本次调用（§2.2/§6.6）。
+func (sc *SandboxContext) ResolvePolicy() sandbox.Policy { return sc.Policy }
+
+// SandboxOptions 是 agent 级 standing 沙箱配置（§2.2 优先级的部署默认项）；
+// agent 每次工具调用由此派生 SandboxContext。
+type SandboxOptions struct {
+	Mode     sandbox.Mode
+	Root     string // workspace 根（session cwd canonical 化，§2.2）
+	Runner   string
+	Approver sandbox.Approver
+	Policy   sandbox.ApprovalPolicy
+}
+
+// Context 为一次工具调用派生 SandboxContext（CallID=本次调用 id）。
+func (so *SandboxOptions) Context(sessionID, callID string) *SandboxContext {
+	return &SandboxContext{
+		Policy:    sandbox.Policy{Mode: so.Mode, WorkspaceRoot: so.Root},
+		Runner:    so.Runner,
+		Approver:  so.Approver,
+		Approval:  so.Policy,
+		SessionID: sessionID,
+		CallID:    callID,
+	}
 }
 
 // Result 是工具执行结果（对应 ToolExecutionSuccess/Failure 的扁平投影）。

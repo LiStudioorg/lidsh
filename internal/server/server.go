@@ -13,6 +13,7 @@ import (
 
 	"lidsh/internal/agent"
 	"lidsh/internal/llm"
+	"lidsh/internal/sandbox"
 	"lidsh/internal/session"
 	"lidsh/internal/tools"
 
@@ -30,6 +31,9 @@ type Options struct {
 	Reason   llm.ReasoningEffort
 	System   string
 	Adapter  llm.Adapter
+	// Sandbox 是沙箱 standing 配置（M2）；nil 或 danger-full-access=未挂载
+	// confinement executor（不 advertise 提权字段，bash 直跑）。
+	Sandbox *tools.SandboxOptions
 }
 
 // Server 持有一个 host 的全部会话与连接。
@@ -67,9 +71,15 @@ type entry struct {
 // New 构造服务器。
 func New(opts Options) *Server {
 	reg := tools.NewRegistry()
-	tools.RegisterBash(reg)
+	// 沙箱挂载判定（§1.2/§6.1）：挂载 confinement executor 才 advertise
+	// sandbox_permissions/justification；danger-full-access/未配置 → 普通直跑。
+	if opts.Sandbox != nil && opts.Sandbox.Mode != sandbox.ModeDangerFullAccess {
+		tools.RegisterBashSandbox(reg)
+	} else {
+		tools.RegisterBash(reg)
+	}
 	tools.RegisterFSTools(reg)
-	return &Server{
+	s := &Server{
 		Opts:       opts,
 		Tools:      reg,
 		upgrade:    websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
@@ -78,6 +88,11 @@ func New(opts Options) *Server {
 		hub:        newHub(),
 		waterfalls: map[string]*waterfall{},
 	}
+	// 沙箱挂载时绑定瀑布审批通道（浏览器经 $events/result 回环应答，§6.5）。
+	if s.Opts.Sandbox != nil && s.Opts.Sandbox.Approver == nil {
+		s.Opts.Sandbox.Approver = &waterfallApprover{s}
+	}
+	return s
 }
 
 // Handler 返回根 http.Handler（挂 /api/remote.mux 与 /api/* 一元 RPC）。

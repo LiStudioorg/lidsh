@@ -46,6 +46,7 @@ func RunWeb(ctx context.Context, home, workdir string, args []string) error {
 		Reason:   llm.EffortHigh,
 		System:   webSystemPrompt(workdir),
 		Adapter:  adapter,
+		Sandbox:  buildSandboxConfig(workdir, false),
 	})
 
 	addr := net.JoinHostPort(host, port)

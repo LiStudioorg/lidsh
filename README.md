@@ -26,7 +26,7 @@ DSH 不是一个"CLI + 网页"，而是一套由五层拼起来的系统：
 | **M1a** | session JSONL+zstd 存储、agent 循环（turn/step 状态机）、工具集（bash/read/write/edit/glob/grep）、headless 一次对话入口、端到端持久化测试 | ✅ 完成 |
 | **M1b** | `/api/remote.mux` WS mux + HTTP 一元 RPC 回环 + 会话控制器；会话 JSONL+zstd 持久化写路径、`$events` 审批瀑布回环（`$events/result`）、附件文件上传接收 | ✅ 完成 |
 | **M1c** | Vue 三栏 UI（会话列表/消息流/工具卡片/输入条）+ 设置-模型页 + 双主题，Vue→`go:embed` 单二进制 | ✅ 完成 |
-| **M2** | compaction、goal/ralph、workflow、sandbox 提权、schedule | ⬜ |
+| **M2** | compaction、goal/ralph、workflow、sandbox 提权、schedule | 🔨 进行中（sandbox 提权 ✅：内核级 Landlock confinement + 审批瀑布闭环） |
 
 当前所有能跑的包都有单元测试锁定语义（`go test ./...` 全绿），headless 入口与 `lidsh web` 的 WS/HTTP 会话环都用可注入的假 LLM 适配器做了端到端验证（会话创建 → agent 跑 → 事件 zstd 落盘 → 回读；create→follow→prompt→snapshot+event；上传→收据→内容寻址存储）。
 
@@ -42,6 +42,7 @@ internal/
   llm/                provider 抽象 + OpenAI/DeepSeek 兼容适配器（SSE 泵、7 种 StreamChunk）
   agent/              agent 循环：turn/step 状态机、流聚合 assembly、工具调度、崩溃恢复
   tools/              工具注册表 + bash/read/write/edit/glob/grep（复刻 dsh-tools 契约）
+  sandbox/            沙箱语义层：模式枚举/升级阶梯/审批编排/Landlock confinement/写 fence
   app/                profile 装配、Boot、headless 入口
   protocol/           typert 远程流帧结构（open/cancel/item/end/error/ready/emit/waterfall）
   server/             API 网关 + WS mux + 会话控制器：RPC/随访流/持久化写路径/瀑布回环/上传
@@ -97,6 +98,22 @@ headless 会：创建会话 → 逐步执行 bash/文件工具 → 把最终回�
 
 - `$LIDSH_HOME`（默认 `~/.lidsh`）— 会话、设置、profile 的根目录。对应 DSH 的 `$DSH_HOME`，但独立命名以免误读真实 DSH 配置。
 - `.env`（项目目录）— 启动时读取；黑名单键（`PATH`/`HOME`/`NODE_OPTIONS`/`LD_PRELOAD`/`BASH_ENV`…）拒绝写入，忠实复刻 DSH 的引导期 env 保护。
+
+### 沙箱与提权（M2，复刻 DSH 语义级 + 内核级）
+
+`bash`/`write`/`edit` 默认不挂沙箱（直跑，等价实测 DSH 部署的 `danger-full-access`）。设置 `LIDSH_SANDBOX` 即挂载 confinement executor：
+
+```bash
+export LIDSH_SANDBOX=read-only        # 或 workspace-write；不设=danger-full-access（不挂载）
+export LIDSH_SANDBOX_APPROVAL=ask     # ask（默认，浏览器审批）| never（提权直接拒绝）
+```
+
+挂载后行为（逐条对照 DSH）：
+
+- **内核级隔离**（不是路径检查）：Linux runner 链 `bwrap → 原生 Landlock`，回退不可用则执行期 fail-closed。Landlock 走自再执行子命令 `lidsh sandbox-exec`（self-restrict-then-exec，与 DSH 的 `landlock-run` 同构）。
+- **拒绝标记**：命令被拒时输出追加 `[sandbox: file access denied under <mode> mode]` + 升级提示；fs 工具写 fence 同文案（canonicalize-then-contain 判定）。
+- **提权闭环**：模型带 `sandbox_permissions`（严格更宽：read-only→workspace-write/danger，workspace-write→danger）+ `justification` 重试 → `approval/request` 经 `$events` 瀑布下发浏览器 → `POST /api/$events/result` 回 `allowed-once` → 获批 mode **仅本次调用生效**；非更宽/审批拒绝/无通道一律 fail-closed。
+- headless 无浏览器通道：提权请求 fail-closed（"no approval channel is available"），与 DSH headless 同语义。
 
 ## CLI 文法（复刻 DSH launcher）
 

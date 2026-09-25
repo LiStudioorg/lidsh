@@ -56,6 +56,10 @@ func (a *Agent) runTool(turn, step int, blk llm.ContentBlock) (*tools.Result, *l
 
 	call := tools.ToolCall{CallID: blk.ID, RootCallID: blk.ID, Name: blk.Name, Arguments: args}
 	ec := &tools.ExecContext{Signal: a.Signal, AgentCWD: a.CWD, CWD: a.CWD}
+	// M2：挂载沙箱组合时，每次调用派生 SandboxContext（§6.3 载荷含 callId/agent）。
+	if a.Sandbox != nil {
+		ec.Sandbox = a.Sandbox.Context(a.Sess.Header.ID, blk.ID)
+	}
 	tr, err := a.Tools.Execute(call, ec)
 	if err != nil {
 		// registry 层异常：合成 isError 失败结果。

@@ -40,6 +40,9 @@ type Agent struct {
 	// CWD 是会话工作目录。
 	CWD string
 
+	// Sandbox 是沙箱 standing 配置（M2；nil=未挂载）。
+	Sandbox *tools.SandboxOptions
+
 	Signal context.Context
 
 	phase   Phase
@@ -57,6 +60,9 @@ type Options struct {
 	Reason   llm.ReasoningEffort
 	System   string
 	CWD      string
+	// Sandbox 是挂载沙箱组合的 standing 配置（M2）；nil=未挂载
+	// confinement executor（工具不感知沙箱，提权字段不 advertise）。
+	Sandbox *tools.SandboxOptions
 }
 
 // New 构造 agent。
@@ -66,7 +72,8 @@ func New(opts Options) *Agent {
 		Sess: opts.Sess, Resolver: opts.Resolver, Tools: opts.Tools,
 		Provider: opts.Provider, Model: opts.Model, Reason: opts.Reason,
 		System: opts.System, CWD: opts.CWD,
-		Signal: sig, sig: cancel,
+		Sandbox: opts.Sandbox,
+		Signal:  sig, sig: cancel,
 	}
 }
 

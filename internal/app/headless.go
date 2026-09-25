@@ -24,6 +24,7 @@ import (
 
 	"lidsh/internal/agent"
 	"lidsh/internal/llm"
+	"lidsh/internal/sandbox"
 	"lidsh/internal/session"
 	"lidsh/internal/tools"
 )
@@ -90,18 +91,24 @@ func runHeadlessCore(ctx context.Context, home, workdir, provider, model, prompt
 		_ = lw.AppendEvent(e)
 	})
 
-	// 工具：bash + 文件工具。
+	// 工具：bash + 文件工具（挂沙箱时 advertise 提权字段，§1.2/§6.1）。
 	reg := tools.NewRegistry()
-	tools.RegisterBash(reg)
+	sb := buildSandboxConfig(workdir, true)
+	if sb != nil && sb.Mode != sandbox.ModeDangerFullAccess {
+		tools.RegisterBashSandbox(reg)
+	} else {
+		tools.RegisterBash(reg)
+	}
 	tools.RegisterFSTools(reg)
 
 	a := agent.New(agent.Options{
 		Sess:     sess,
 		Resolver: agent.NewStaticResolver(map[string]llm.Adapter{provider: adapter}),
 		Tools:    reg, Provider: provider, Model: model,
-		Reason: llm.EffortHigh,
-		System: headlessSystemPrompt(workdir),
-		CWD:    workdir,
+		Reason:  llm.EffortHigh,
+		System:  headlessSystemPrompt(workdir),
+		CWD:     workdir,
+		Sandbox: sb,
 	})
 
 	res, err := a.Prompt(prompt, "followup")
