@@ -1,0 +1,15 @@
+# 构建产物
+/bin/
+/web/dist/
+/internal/webui/dist/
+
+# 依赖
+node_modules/
+
+# 逆向参考材料：DSH 编译产物与 patch 原文副本，仅本地调研用，不入库
+/ref/
+
+# 本地调试数据
+/lidsh-home/
+*.log
+.env
