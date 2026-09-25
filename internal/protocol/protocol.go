@@ -35,8 +35,8 @@ type ClientCancel struct {
 }
 
 // IsOpen 判断 browser 帧类型。
-func IsClientOpen(t string) bool          { return t == "open" }
-func IsClientCancel(t string) bool        { return t == "cancel" }
+func IsClientOpen(t string) bool   { return t == "open" }
+func IsClientCancel(t string) bool { return t == "cancel" }
 
 // ---------- Host → 浏览器 ----------
 
@@ -87,11 +87,11 @@ type ServerEmit struct {
 
 // ServerWaterfall 是 $events 流的瀑布请求帧（§5.5.2）。
 type ServerWaterfall struct {
-	Type     string          `json:"type"` // "waterfall"
-	Event    string          `json:"event"`
-	EventID  string          `json:"eventId"`
-	AgentID  string          `json:"agentId"`
-	Request  json.RawMessage `json:"request"`
+	Type    string          `json:"type"` // "waterfall"
+	Event   string          `json:"event"`
+	EventID string          `json:"eventId"`
+	AgentID string          `json:"agentId"`
+	Request json.RawMessage `json:"request"`
 }
 
 // ServerStreamCancel 是 $events 流的瀑布取消帧（§5.5.3）。
@@ -115,36 +115,39 @@ type RPCPayload struct {
 	Args json.RawMessage `json:"args"`
 }
 
-// RPCResponse 是 HTTP 一元 RPC 响应信封（错误永不 throw，只 ok:false，§5.2）。
+// RPCResponse 是 HTTP 一元 RPC 响应信封（§5.2；恒 HTTP 200，业务错误不抛异常）。
 type RPCResponse struct {
+	Type   string       `json:"type"`  // "server-response"
+	RPCID  string       `json:"rpcId"` // 回显请求 rpcId
+	Result RemoteResult `json:"result"`
+}
+
+// RemoteResult 是 RPC 结果（ok:true value | ok:false error，永不 throw）。
+type RemoteResult struct {
 	Ok    *bool           `json:"ok"`
 	Value json.RawMessage `json:"value,omitempty"`
-	Error *RPCError       `json:"error,omitempty"`
+	Error *RemoteError    `json:"error,omitempty"`
 }
 
-// RPCError 是 RPC 响应的 error 体。
-type RPCError struct {
-	Name    string          `json:"name"`
-	Message string          `json:"message"`
-	Code    string          `json:"code,omitempty"`
-	Details json.RawMessage `json:"details,omitempty"`
-}
+// RPCError 已并入 RemoteError（§5.4 同形：code/message/details）。
 
-// OK 构造成功响应。
-func OK(value any) RPCResponse {
+// OK 构造成功 RPC 响应。
+func OK(rpcID string, value any) RPCResponse {
 	b, _ := json.Marshal(value)
 	t := true
-	return RPCResponse{Ok: &t, Value: json.RawMessage(b)}
+	return RPCResponse{Type: "server-response", RPCID: rpcID,
+		Result: RemoteResult{Ok: &t, Value: json.RawMessage(b)}}
 }
 
 // OKVoid 构造无值成功响应（value:undefined）。
-func OKVoid() RPCResponse {
+func OKVoid(rpcID string) RPCResponse {
 	t := true
-	return RPCResponse{Ok: &t}
+	return RPCResponse{Type: "server-response", RPCID: rpcID, Result: RemoteResult{Ok: &t}}
 }
 
-// Fail 构造失败响应。
-func Fail(code, message string) RPCResponse {
+// Fail 构造失败 RPC 响应。
+func Fail(rpcID, code, message string) RPCResponse {
 	f := false
-	return RPCResponse{Ok: &f, Error: &RPCError{Name: "Error", Message: message, Code: code}}
+	return RPCResponse{Type: "server-response", RPCID: rpcID,
+		Result: RemoteResult{Ok: &f, Error: &RemoteError{Code: code, Message: message}}}
 }

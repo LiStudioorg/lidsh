@@ -103,7 +103,7 @@ func Boot(ctx context.Context, opts BootOptions) error {
 	case "headless":
 		return RunHeadless(ctx, opts.Workdir, opts.Home, opts.AppArgs)
 	case "web":
-		return fmt.Errorf("profile %q 的应用循环属 M1b（WS 网关 + 前端）；当前用 --dump-config 查看配置树", opts.Profile)
+		return RunWeb(ctx, opts.Home, opts.Workdir, opts.AppArgs)
 	default:
 		return fmt.Errorf("profile %q 的入口属后续里程碑；当前用 --dump-config 查看配置树", opts.Profile)
 	}
