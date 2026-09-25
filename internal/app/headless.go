@@ -1,0 +1,166 @@
+// headless 入口：无 GUI 跑一次 agent 对话（接受一个用户输入 → 逐步执行
+// 工具 → 输出最终回答，事件流落盘到 $LIDSH_HOME）。
+//
+// 配置来源（M1a，环境变量；settings/credentials 层后续里程碑接入）：
+//
+//	LIDSH_API_KEY   必需，提供方 API key
+//	LIDSH_BASE_URL  默认 https://api.deepseek.com
+//	LIDSH_MODEL     默认 deepseek-chat
+//	LIDSH_PROVIDER  默认 deepseek-official
+//
+// 输入：stdin 全文或第一个非 flag 参数；输出：最终 assistant 文本到 stdout；
+// 事件与进度到 stderr。
+package app
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"lidsh/internal/agent"
+	"lidsh/internal/llm"
+	"lidsh/internal/session"
+	"lidsh/internal/tools"
+)
+
+// RunHeadless 执行一次 headless 对话。
+func RunHeadless(ctx context.Context, workdir, home string, args []string) error {
+	prompt, err := parseHeadlessPrompt(args)
+	if err != nil {
+		return err
+	}
+
+	apiKey := envOr("LIDSH_API_KEY", "")
+	if apiKey == "" {
+		return fmt.Errorf("headless: LIDSH_API_KEY is required (set it or pass in .env)")
+	}
+	baseURL := envOr("LIDSH_BASE_URL", "https://api.deepseek.com")
+	model := envOr("LIDSH_MODEL", "deepseek-chat")
+	provider := envOr("LIDSH_PROVIDER", "deepseek-official")
+
+	adapter := llm.NewOpenAI(llm.OpenAIConfig{
+		Provider:         provider,
+		BaseURL:          baseURL,
+		APIKey:           apiKey,
+		SessionIDHeader:  "x-deepseek-harness-session-id",
+		SupportsThinking: true, // DeepSeek 形态
+	})
+
+	// 会话目录 & 持久化。
+	id := session.NewID()
+	dir := session.SessionDir(home, workdir, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("headless: mkdir %s: %w", dir, err)
+	}
+	lease, err := session.AcquireLease(dir)
+	if err != nil {
+		return fmt.Errorf("headless: %w", err)
+	}
+	defer lease.Release()
+
+	hdr := session.NewHeader(id, workdir, session.Meta{AgentPreset: "standard"})
+	sess := session.New(hdr)
+
+	// 写 header 帧，事件追加落盘。
+	logPath := filepath.Join(dir, session.LogFileName(session.FormatVersion, "zstd"))
+	lw, err := session.OpenLogWriter(logPath, "zstd", 0)
+	if err != nil {
+		return fmt.Errorf("headless: %w", err)
+	}
+	defer lw.Close()
+	hb, err := json.Marshal(hdr)
+	if err != nil {
+		return err
+	}
+	if err := lw.Append([][]byte{hb}); err != nil {
+		return fmt.Errorf("headless: write header: %w", err)
+	}
+	sess.OnEvent(func(e *session.Event) {
+		_ = lw.AppendEvent(e)
+	})
+
+	// 工具：bash + 文件工具。
+	reg := tools.NewRegistry()
+	tools.RegisterBash(reg)
+	tools.RegisterFSTools(reg)
+
+	a := agent.New(agent.Options{
+		Sess:     sess,
+		Resolver: agent.NewStaticResolver(map[string]llm.Adapter{provider: adapter}),
+		Tools:    reg, Provider: provider, Model: model,
+		Reason: llm.EffortHigh,
+		System: headlessSystemPrompt(workdir),
+		CWD:    workdir,
+	})
+
+	res, err := a.Prompt(prompt, "followup")
+	if err != nil {
+		return fmt.Errorf("headless: %v", err)
+	}
+	if res.Kind == "aborted" {
+		return fmt.Errorf("headless: aborted: %v", res.Err)
+	}
+	if res.Kind == "error" && res.Err != nil {
+		return fmt.Errorf("headless: %v", res.Err)
+	}
+
+	// 输出最终 assistant 文本（surface 最后一条 assistant 消息）。
+	text := lastAssistantText(sess.DeriveMessages())
+	if text != "" {
+		fmt.Println(text)
+	}
+	if res.Kind == "max-tokens" {
+		fmt.Fprintln(os.Stderr, "\n(reached max tokens)")
+	}
+	return nil
+}
+
+// lastAssistantText 取 surface 里最后一条 assistant 文本块拼接。
+func lastAssistantText(msgs []llm.Message) string {
+	var last string
+	for _, m := range msgs {
+		if m.Role == llm.RoleAssistant {
+			var sb strings.Builder
+			for _, blk := range m.Content {
+				if blk.Type == "text" {
+					sb.WriteString(blk.Text)
+				}
+			}
+			last = sb.String()
+		}
+	}
+	return last
+}
+
+// headlessSystemPrompt 是一条最小系统提示，指明工作目录与工具能力。
+func headlessSystemPrompt(workdir string) string {
+	return fmt.Sprintf("You are lidsh, a coding agent. Work in directory %s. "+
+		"You have shell and file tools; use them, then give a final answer. "+
+		"Be concise and show relevant output.", workdir)
+}
+
+// parseHeadlessPrompt：args 里第一个非 flag token 是提示词；无则读 stdin 全文。
+func parseHeadlessPrompt(args []string) (string, error) {
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			return a, nil
+		}
+	}
+	data, err := io.ReadAll(bufio.NewReader(os.Stdin))
+	if err != nil {
+		return "", fmt.Errorf("headless: read stdin: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}

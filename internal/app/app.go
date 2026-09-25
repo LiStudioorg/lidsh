@@ -100,6 +100,8 @@ func Boot(ctx context.Context, opts BootOptions) error {
 		opts.Profile, len(app.Activated()), app.IDs())
 
 	switch opts.Profile {
+	case "headless":
+		return RunHeadless(ctx, opts.Workdir, opts.Home, opts.AppArgs)
 	case "web":
 		return fmt.Errorf("profile %q 的应用循环属 M1b（WS 网关 + 前端）；当前用 --dump-config 查看配置树", opts.Profile)
 	default:
