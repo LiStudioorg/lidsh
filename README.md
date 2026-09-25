@@ -24,11 +24,11 @@ DSH 不是一个"CLI + 网页"，而是一套由五层拼起来的系统：
 |---|---|---|
 | **M0** | 仓库骨架、patch 配置引擎 + `--dump-config`、服务容器、CLI 文法、逆向文档 | ✅ 完成 |
 | **M1a** | session JSONL+zstd 存储、agent 循环（turn/step 状态机）、工具集（bash/read/write/edit/glob/grep）、headless 一次对话入口、端到端持久化测试 | ✅ 完成 |
-| **M1b** | `/api/remote.mux` WS mux + HTTP 一元 RPC 回环 + 会话控制器 | 🔨 进行中 |
+| **M1b** | `/api/remote.mux` WS mux + HTTP 一元 RPC 回环 + 会话控制器；会话 JSONL+zstd 持久化写路径、`$events` 审批瀑布回环（`$events/result`）、附件文件上传接收 | ✅ 完成 |
 | **M1c** | Vue 三栏 UI：消息流、工具卡片、会话列表、设置-模型页、双主题 | ⬜ |
 | **M2** | compaction、goal/ralph、workflow、sandbox 提权、schedule | ⬜ |
 
-当前所有能跑的包都有单元测试锁定语义（`go test ./...` 全绿），headless 入口用可注入的假 LLM 适配器做了端到端验证（会话创建 → agent 跑 → 事件 zstd 落盘 → 回读）。
+当前所有能跑的包都有单元测试锁定语义（`go test ./...` 全绿），headless 入口与 `lidsh web` 的 WS/HTTP 会话环都用可注入的假 LLM 适配器做了端到端验证（会话创建 → agent 跑 → 事件 zstd 落盘 → 回读；create→follow→prompt→snapshot+event；上传→收据→内容寻址存储）。
 
 ## 目录结构
 
