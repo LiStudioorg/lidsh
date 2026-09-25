@@ -15,6 +15,7 @@ import (
 
 	"lidsh/internal/llm"
 	"lidsh/internal/server"
+	"lidsh/internal/webui"
 )
 
 // RunWeb 启动 web profile 的 HTTP 服务器（阻塞直到 ctx 取消或监听失败）。
@@ -48,9 +49,13 @@ func RunWeb(ctx context.Context, home, workdir string, args []string) error {
 	})
 
 	addr := net.JoinHostPort(host, port)
+	// 根 mux：/api/* 交给 server 的 API+WS 网关；其余（前端静态 + SPA fallback）交给 webui。
+	root := http.NewServeMux()
+	root.Handle("/api/", srv.Handler())
+	root.Handle("/", webui.Handler())
 	httpSrv := &http.Server{
 		Addr:    addr,
-		Handler: srv.Handler(),
+		Handler: root,
 	}
 
 	// 启动后在 ctx 取消时优雅关闭。

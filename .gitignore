@@ -13,3 +13,6 @@ node_modules/
 /lidsh-home/
 *.log
 .env
+
+# vue-tsc 增量构建缓存
+web/tsconfig.tsbuildinfo

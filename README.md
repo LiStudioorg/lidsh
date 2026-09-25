@@ -25,7 +25,7 @@ DSH 不是一个"CLI + 网页"，而是一套由五层拼起来的系统：
 | **M0** | 仓库骨架、patch 配置引擎 + `--dump-config`、服务容器、CLI 文法、逆向文档 | ✅ 完成 |
 | **M1a** | session JSONL+zstd 存储、agent 循环（turn/step 状态机）、工具集（bash/read/write/edit/glob/grep）、headless 一次对话入口、端到端持久化测试 | ✅ 完成 |
 | **M1b** | `/api/remote.mux` WS mux + HTTP 一元 RPC 回环 + 会话控制器；会话 JSONL+zstd 持久化写路径、`$events` 审批瀑布回环（`$events/result`）、附件文件上传接收 | ✅ 完成 |
-| **M1c** | Vue 三栏 UI：消息流、工具卡片、会话列表、设置-模型页、双主题 | ⬜ |
+| **M1c** | Vue 三栏 UI（会话列表/消息流/工具卡片/输入条）+ 设置-模型页 + 双主题，Vue→`go:embed` 单二进制 | ✅ 完成 |
 | **M2** | compaction、goal/ralph、workflow、sandbox 提权、schedule | ⬜ |
 
 当前所有能跑的包都有单元测试锁定语义（`go test ./...` 全绿），headless 入口与 `lidsh web` 的 WS/HTTP 会话环都用可注入的假 LLM 适配器做了端到端验证（会话创建 → agent 跑 → 事件 zstd 落盘 → 回读；create→follow→prompt→snapshot+event；上传→收据→内容寻址存储）。
@@ -44,7 +44,9 @@ internal/
   tools/              工具注册表 + bash/read/write/edit/glob/grep（复刻 dsh-tools 契约）
   app/                profile 装配、Boot、headless 入口
   protocol/           typert 远程流帧结构（open/cancel/item/end/error/ready/emit/waterfall）
-  server/, webui/     （M1b/M1c 落地）
+  server/             API 网关 + WS mux + 会话控制器：RPC/随访流/持久化写路径/瀑布回环/上传
+  webui/              Go://go:embed 前端产物 → 静态服务 + SPA fallback
+web/                   Vue3 前端源码（Vite，三栏 UI/主题/设置页；构建产物 embed 进 webui）
 docs/                 DSH 逆向文档（00-architecture / integrations / ui-tokens / _parts 分块）
 ref/                  DSH 参考源码拷贝（gitignored，逆向用）
 ```
@@ -66,7 +68,16 @@ bin/lidsh --profile web --dump-config
 bin/lidsh --dump-default-config
 ```
 
-> 前端 embed 的单二进制构建链（`web/` Vite 构建 → `go:embed`）属 M1c，届时提供 `make release`。目前先跑 M1a 的 headless 入口。
+> **单二进制构建（M1c）**：前端 `web/` 经 Vite 构建到 `internal/webui/dist`，被 `//go:embed` 打进可执行文件。因此 `go build` / `go test ./...` **需要先构建前端**（否则 embed 缺源会编译失败）。用 Makefile 一键完成：
+>
+> ```bash
+> make build            # build-frontend + go build（产出 bin/lidsh，含内嵌 UI）
+> make release          # 产出 ./release/lidsh 单二进制（linux/amd64，压缩）
+> make build-frontend   # 仅重构建前端到 internal/webui/dist
+> make test             # build-frontend + go test ./...
+> ```
+>
+> 前端开发热更：`cd web && pnpm dev`（Vite 把 `/api` 代理到 `127.0.0.1:3000`）。交互形态复刻 DSH：`body[data-ds-dark-theme]` 切暗色 + `color-scheme`，正文字号轴 `--dsh-content-font-size`（12–17，默认 14）。
 
 ### headless 一次对话（M1a 已可用，无需 GUI）
 
