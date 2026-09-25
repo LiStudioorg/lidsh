@@ -46,11 +46,22 @@ type Server struct {
 	subs  map[string]map[*conn]struct{} // sessionID → conn 集
 
 	hub *hub // $events 广播（活跃连接）
+
+	// 在途瀑布表：eventId → waterfall（§5.5 回环）。
+	wfMu       sync.Mutex
+	waterfalls map[string]*waterfall
+
+	// 已暂存文件收据：sessionID → receiptId → stagedFile（上传→prompt 解析）。
+	stageMu sync.Mutex
+	staged  map[string]map[string]stagedFile
 }
 
 type entry struct {
 	sess  *session.Session
 	agent *agent.Agent
+	// 持久化写路径：会话目录、写锁、增量日志（M1b 接回 M1a 的 JSONL+zstd）。
+	dir string
+	lw  *session.LogWriter
 }
 
 // New 构造服务器。
@@ -59,12 +70,13 @@ func New(opts Options) *Server {
 	tools.RegisterBash(reg)
 	tools.RegisterFSTools(reg)
 	return &Server{
-		Opts:     opts,
-		Tools:    reg,
-		upgrade:  websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
-		sessions: map[string]*entry{},
-		subs:     map[string]map[*conn]struct{}{},
-		hub:      newHub(),
+		Opts:       opts,
+		Tools:      reg,
+		upgrade:    websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
+		sessions:   map[string]*entry{},
+		subs:       map[string]map[*conn]struct{}{},
+		hub:        newHub(),
+		waterfalls: map[string]*waterfall{},
 	}
 }
 
@@ -73,6 +85,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/remote.mux", s.handleMux)
 	mux.HandleFunc("/api/", s.handleAPI) // /api/{namespace}/{method}
+	s.registerUpload(mux)                // /api/session/uploadFileBinary
 	return mux
 }
 

@@ -5,8 +5,11 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 
 	"lidsh/internal/agent"
 	"lidsh/internal/llm"
@@ -26,9 +29,7 @@ func (s *Server) dispatchRPC(endpoint string, req protocolRPCRequest) protocolRP
 	case "session/list":
 		return s.rpcSessionList(rpcID, req)
 	case "$events/result":
-		// M1b：无 waterfall 待决，恒 ok（浏览器接到的应答；§5.5）。
-		return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
-			Result: protocolRPCResult{Ok: bptr(true)}}
+		return s.rpcEventsResult(rpcID, req)
 	default:
 		return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
 			Result: protocolRPCResult{Ok: bptr(false),
@@ -63,18 +64,57 @@ func (s *Server) rpcSessionCreate(rpcID string, req protocolRPCRequest) protocol
 	}
 	hdr := session.NewHeader(id, s.Opts.Workdir, meta)
 	sess := session.New(hdr)
+
+	// 持久化：建会话目录、持写锁、写 header 帧、事件增量落盘（复刻 headless 核心）。
+	ent, err := s.newPersisted(id, sess, hdr)
+	if err != nil {
+		return rpcFailResult(rpcID, "session/conflict", err.Error())
+	}
+
 	// 事件广播给订阅该会话的 follow 连接。
 	sess.OnEvent(func(e *session.Event) {
 		s.emitEvent(id, e)
 	})
 
 	s.mu.Lock()
-	s.sessions[id] = &entry{sess: sess}
+	s.sessions[id] = ent
 	s.mu.Unlock()
 
 	return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
 		Result: protocolRPCResult{Ok: bptr(true),
 			Value: mustRaw(map[string]any{"sessionId": id, "agentPreset": meta.AgentPreset})}}
+}
+
+// newPersisted 打开会话目录与增量日志，并挂 OnEvent→AppendEvent 写路径。
+func (s *Server) newPersisted(id string, sess *session.Session, hdr session.Header) (*entry, error) {
+	dir := session.SessionDir(s.Opts.Home, s.Opts.Workdir, id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("session/dir: %w", err)
+	}
+	lease, err := session.AcquireLease(dir)
+	if err != nil {
+		return nil, fmt.Errorf("session/lock: %w", err)
+	}
+	logPath := filepath.Join(dir, session.LogFileName(session.FormatVersion, "zstd"))
+	lw, err := session.OpenLogWriter(logPath, "zstd", 0)
+	if err != nil {
+		lease.Release()
+		return nil, fmt.Errorf("session/log: %w", err)
+	}
+	hb, err := json.Marshal(hdr)
+	if err != nil {
+		lw.Close()
+		lease.Release()
+		return nil, err
+	}
+	if err := lw.Append([][]byte{hb}); err != nil {
+		lw.Close()
+		lease.Release()
+		return nil, fmt.Errorf("session/log header: %w", err)
+	}
+	// 事件落盘：OnEvent 里先写盘再广播（调用方再挂广播 handler，二者各自独立）。
+	sess.OnEvent(func(e *session.Event) { _ = lw.AppendEvent(e) })
+	return &entry{sess: sess, dir: dir, lw: lw}, nil
 }
 
 // ---- session/prompt ----
@@ -193,6 +233,62 @@ func (s *Server) rpcSessionList(rpcID string, req protocolRPCRequest) protocolRP
 	s.mu.Unlock()
 	return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
 		Result: protocolRPCResult{Ok: bptr(true), Value: mustRaw(map[string]any{"items": items})}}
+}
+
+// ---- $events/result（§5.5 瀑布回环） ----
+
+type eventsResultArgs struct {
+	ClientID string         `json:"clientId"`
+	EventID  string         `json:"eventId"`
+	Outcome  *eventsOutcome `json:"outcome"`
+}
+
+type eventsOutcome struct {
+	Kind  string          `json:"kind"` // next | result | rejected
+	Value json.RawMessage `json:"value,omitempty"`
+	Error *struct {
+		Name    string          `json:"name"`
+		Message string          `json:"message"`
+		Code    string          `json:"code,omitempty"`
+		Details json.RawMessage `json:"details,omitempty"`
+	} `json:"error,omitempty"`
+}
+
+func (s *Server) rpcEventsResult(rpcID string, req protocolRPCRequest) protocolRPCResponse {
+	var p protocolRPCPayload
+	if err := json.Unmarshal(req.Payload, &p); err != nil {
+		return rpcFailResult(rpcID, "gateway/bad-request", err.Error())
+	}
+	var a eventsResultArgs
+	if err := json.Unmarshal(p.Args, &a); err != nil {
+		return rpcFailResult(rpcID, "gateway/bad-request", err.Error())
+	}
+	if a.Outcome == nil {
+		return rpcFailResult(rpcID, "gateway/bad-request", "outcome required")
+	}
+	switch a.Outcome.Kind {
+	case "next":
+		s.submitResult(a.ClientID, a.EventID, waterfallOutcome{kind: "next"})
+	case "result":
+		s.submitResult(a.ClientID, a.EventID, waterfallOutcome{kind: "result", value: a.Outcome.Value})
+	case "rejected":
+		code, msg := "Error", "rejected"
+		if a.Outcome.Error != nil {
+			if a.Outcome.Error.Code != "" {
+				code = a.Outcome.Error.Code
+			}
+			if a.Outcome.Error.Message != "" {
+				msg = a.Outcome.Error.Message
+			}
+		}
+		s.submitResult(a.ClientID, a.EventID, waterfallOutcome{kind: "rejected", errCode: code, errMsg: msg})
+	default:
+		return rpcFailResult(rpcID, "gateway/bad-request", "unknown outcome kind")
+	}
+	// 客户端应答始终 ok:true（未知 clientId/已 settle 的 result 被静默丢弃；
+	// 该场景网关 client 端返回 {ok:true,value:undefined}，§5.5）。
+	return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
+		Result: protocolRPCResult{Ok: bptr(true)}}
 }
 
 // ---- helpers ----

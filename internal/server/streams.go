@@ -25,9 +25,22 @@ func (s *Server) startStream(c *conn, f protocolOpen, active <-chan struct{}) bo
 
 // runEvents 每代流第一帧 ready，然后挂到 hub 广播直到取消。
 func (s *Server) runEvents(c *conn, f protocolOpen, active <-chan struct{}) {
+	clientID := newUUID()
+	// 标记该连接 open 了 $events（供瀑布/emit 定向投递），defer 退出时清除。
+	c.mu.Lock()
+	c.events = true
+	c.eventsClientID = clientID
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.events = false
+		c.eventsClientID = ""
+		c.mu.Unlock()
+	}()
+
 	ready := map[string]any{
 		"type":     "ready",
-		"clientId": newUUID(),
+		"clientId": clientID,
 		"host":     map[string]any{"home": s.Opts.Home},
 	}
 	if err := c.writeLine(ready); err != nil {

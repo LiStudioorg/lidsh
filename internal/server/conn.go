@@ -26,6 +26,10 @@ type conn struct {
 	streams map[string]func() // streamId → 取消函数
 	follows map[string]string // sessionID → follow 流的 streamId（emit 反查）
 
+	// $events 流注册：events=true 表示该连接打开过 $events（有 clientId）。
+	events         bool
+	eventsClientID string
+
 	writeMu sync.Mutex
 }
 
