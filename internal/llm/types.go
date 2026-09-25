@@ -12,6 +12,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -45,9 +46,9 @@ type ContentBlock struct {
 	Arguments string `json:"arguments,omitempty"` // JSON 文本，增量拼接后的完整值
 
 	// type=tool-result
-	ToolCallID string          `json:"toolCallId,omitempty"`
-	Content    []ContentBlock  `json:"content,omitempty"`
-	IsError    bool            `json:"isError,omitempty"`
+	ToolCallID string         `json:"toolCallId,omitempty"`
+	Content    []ContentBlock `json:"content,omitempty"`
+	IsError    bool           `json:"isError,omitempty"`
 }
 
 // AttachmentRef 是内容寻址的附件引用。DSH 把二进制留在 append-only 会话日志之外
@@ -61,13 +62,28 @@ type AttachmentRef struct {
 	Height       int    `json:"height,omitempty"`
 }
 
-// Message 是一条会话消息。
+// MessageSource 是消息产出方（MessageSourceMap 的核心四种 kind；插件可扩 kind，
+// 用 RawMessage 承载以保持可扩展，message.d.ts:94-104）。
+type MessageSource struct {
+	Kind   string `json:"kind"` // user|plugin|model|tool
+	Plugin string `json:"plugin,omitempty"`
+	// kind=model（AssistantProvenance）
+	Provider    string          `json:"provider,omitempty"`
+	Model       string          `json:"model,omitempty"`
+	ReplayState json.RawMessage `json:"replayState,omitempty"`
+	// kind=tool
+	CallID string `json:"callId,omitempty"`
+	// kind=plugin 的 ContextForm 标签
+	Form    string `json:"form,omitempty"`    // instructions|catalog|snapshot|notice|relay|recall
+	Summary string `json:"summary,omitempty"` // notice 必填，≤120 字符
+}
+
+// Message 是一条会话消息（message.d.ts:120-129）。
 type Message struct {
+	ID      string         `json:"id"`
 	Role    Role           `json:"role"`
 	Content []ContentBlock `json:"content"`
-	// Model/Provider 在 assistant 消息上记录产出方，供 UI 与标题生成使用。
-	Model    string `json:"model,omitempty"`
-	Provider string `json:"provider,omitempty"`
+	Source  MessageSource  `json:"source"`
 }
 
 // ToolDefinition 是发给模型的工具声明。
@@ -145,9 +161,9 @@ const (
 type BlockType string
 
 const (
-	BlockText     BlockType = "text"
+	BlockText      BlockType = "text"
 	BlockReasoning BlockType = "reasoning"
-	BlockToolCall BlockType = "tool-call"
+	BlockToolCall  BlockType = "tool-call"
 )
 
 // Chunk 是流式产出的一个片段，对应 DSH 的 7 种 StreamChunk。
@@ -165,8 +181,11 @@ type Chunk struct {
 	Delta string `json:"delta,omitempty"`
 
 	// tool-call-delta：按 wire index 聚合，id/name 只认首个非空值。
-	ToolCallIndex   int    `json:"toolCallIndex,omitempty"`
-	ArgumentsDelta  string `json:"argumentsDelta,omitempty"`
+	ToolCallIndex  int    `json:"toolCallIndex,omitempty"`
+	ArgumentsDelta string `json:"argumentsDelta,omitempty"`
+
+	// block-end 携带完整块（types.d.ts:377-380）
+	Block *ContentBlock `json:"block,omitempty"`
 
 	// usage
 	Usage *TokenUsage `json:"usage,omitempty"`
@@ -178,13 +197,13 @@ type Chunk struct {
 
 // 流式片段类型常量。
 const (
-	ChunkBlockStart      = "block-start"
-	ChunkTextDelta       = "text-delta"
-	ChunkReasoningDelta  = "reasoning-delta"
-	ChunkToolCallDelta   = "tool-call-delta"
-	ChunkBlockEnd        = "block-end"
-	ChunkUsage           = "usage"
-	ChunkFinish          = "finish"
+	ChunkBlockStart     = "block-start"
+	ChunkTextDelta      = "text-delta"
+	ChunkReasoningDelta = "reasoning-delta"
+	ChunkToolCallDelta  = "tool-call-delta"
+	ChunkBlockEnd       = "block-end"
+	ChunkUsage          = "usage"
+	ChunkFinish         = "finish"
 )
 
 // ErrorCode 是规范化的失败码。DSH 的规范码子集（llm-core.md 第 4 节）。
@@ -206,11 +225,11 @@ const (
 
 // Failure 是一次生成的失败，携带上游诊断信息。
 type Failure struct {
-	Message              string        `json:"message"`
-	Code                 ErrorCode     `json:"code"`
-	Status               int           `json:"status,omitempty"`
-	ProviderRetryAfterMs int64         `json:"providerRetryAfterMs,omitempty"`
-	RequestID            string        `json:"requestId,omitempty"`
+	Message              string    `json:"message"`
+	Code                 ErrorCode `json:"code"`
+	Status               int       `json:"status,omitempty"`
+	ProviderRetryAfterMs int64     `json:"providerRetryAfterMs,omitempty"`
+	RequestID            string    `json:"requestId,omitempty"`
 }
 
 func (e *Failure) Error() string { return string(e.Code) + ": " + e.Message }
