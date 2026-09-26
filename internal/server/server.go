@@ -7,11 +7,14 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 
 	"lidsh/internal/agent"
+	"lidsh/internal/compaction"
 	"lidsh/internal/goal"
 	"lidsh/internal/llm"
 	"lidsh/internal/sandbox"
@@ -32,6 +35,11 @@ type Options struct {
 	Reason   llm.ReasoningEffort
 	System   string
 	Adapter  llm.Adapter
+	// ContextWindow 是模型容量（compaction 压力换算；0=未知 → 自动压缩
+	// 放行，DSH warn-once 面）。
+	ContextWindow int
+	// Compaction 是压缩配置（nil=不挂压缩引擎）。
+	Compaction *compaction.Config
 	// Sandbox 是沙箱 standing 配置（M2）；nil 或 danger-full-access=未挂载
 	// confinement executor（不 advertise 提权字段，bash 直跑）。
 	Sandbox *tools.SandboxOptions
@@ -80,6 +88,9 @@ type entry struct {
 	busy     bool
 	goalTurn bool
 	queued   []string // busy 时排队的人工输入（competing input 优先于续轮）
+
+	// compactionCfg 是引擎配置（nil=不挂压缩）。
+	compactionCfg *compaction.Config
 }
 
 // ensureAgent 惰性构造共享 agent（跨 turn 复用；surface 已含历史）。
@@ -88,6 +99,13 @@ func (e *entry) ensureAgent() *agent.Agent {
 	defer e.busyMu.Unlock()
 	if e.agent == nil {
 		e.agent = agent.New(e.agentOpts)
+		if e.agent.Compaction == nil && e.compactionCfg != nil {
+			// 引擎在 agent 之后挂（Host=agent 自身）；配置错误 → 不挂载
+			// （DSH TargetPressureConfigError 在自动路径 warn-once 的等价面）。
+			if eng, err := compaction.NewEngine(e.agent, *e.compactionCfg); err == nil {
+				e.agent.Compaction = eng
+			}
+		}
 		if e.goalDrv != nil {
 			gd := e.goalDrv
 			e.agent.GoalGate = func(msg *llm.Message) bool {
@@ -101,6 +119,26 @@ func (e *entry) ensureAgent() *agent.Agent {
 // StartHuman 提交一次人工 prompt（direct-human 权威）。busy 时排队
 // （competing input：人工输入优先于 goal 续轮）。返回是否立即开始。
 func (e *entry) StartHuman(text string) bool {
+	// /compact：手动压缩命令（dsh-command-compact；args 非空 → USAGE）。
+	if trimmed := strings.TrimSpace(text); trimmed == "/compact" || strings.HasPrefix(trimmed, "/compact ") {
+		go func() {
+			var resultText string
+			if strings.TrimSpace(trimmed) != "/compact" {
+				resultText = "Usage: /compact (no arguments)"
+			} else {
+				resultText = e.runCompact()
+			}
+			// 命令输出作为 plugin notice 落面（command/run|done 的收缩面）。
+			_, _ = e.sess.Append(session.EventUserMessage, llm.Message{
+				ID: session.NewMessageID(), Role: llm.RoleUser,
+				Content: []llm.ContentBlock{{Type: "text", Text: resultText}},
+				Source: llm.MessageSource{Kind: "plugin", Plugin: "command-compact",
+					Form: "notice", Summary: "compact"},
+			}, session.AppendOp(), nil)
+			e.driveAfterCommand()
+		}()
+		return true
+	}
 	e.busyMu.Lock()
 	if e.busy {
 		e.queued = append(e.queued, text)
@@ -114,6 +152,51 @@ func (e *entry) StartHuman(text string) bool {
 		e.finishTurn(turnKind(res, err))
 	}()
 	return true
+}
+
+// runCompact 执行一次手动压缩并把 command-compact 的逐字文案返回。
+func (e *entry) runCompact() string {
+	a := e.ensureAgent()
+	res, err := a.CompactNow(a.Signal, "cmd-compact")
+	if err == nil && res == nil {
+		return "No compactable history yet."
+	}
+	if err == nil {
+		return fmt.Sprintf("Compacted %d history items (~%d tokens).",
+			len(res.ShadowedSeqs), res.ShadowedTokenCount)
+	}
+	var mc *compaction.ManualCompactionError
+	if errors.As(err, &mc) {
+		return compactManualText(mc.Code)
+	}
+	return err.Error()
+}
+
+// compactManualText 是 expectedFailure 的逐字映射。
+func compactManualText(code string) string {
+	switch code {
+	case "busy":
+		return "Compaction is unavailable because this process has an active compaction, or the agent is not idle."
+	case "cancelled":
+		return "Compaction cancelled."
+	case "changed":
+		return "The history selected for compaction changed before it could be replaced. The conversation is unchanged; the attempt is recorded in the session log."
+	case "summary":
+		return "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."
+	case "commit":
+		return "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying."
+	case "persistence":
+		return "Compaction finished, but the session could not be saved."
+	default:
+		return "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."
+	}
+}
+
+// driveAfterCommand 让压缩后的空闲面重新驱动 goal 续轮（若有）。
+func (e *entry) driveAfterCommand() {
+	if d := e.goalDrv; d != nil {
+		d.RequestDrive()
+	}
 }
 
 // Cancel 取消在途 turn（session/cancel 对应物）。

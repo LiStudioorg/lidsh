@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 
+	"lidsh/internal/compaction"
 	"lidsh/internal/llm"
 	"lidsh/internal/server"
 	"lidsh/internal/webui"
@@ -39,14 +40,16 @@ func RunWeb(ctx context.Context, home, workdir string, args []string) error {
 	})
 
 	srv := server.New(server.Options{
-		Home:     home,
-		Workdir:  workdir,
-		Provider: provider,
-		Model:    model,
-		Reason:   llm.EffortHigh,
-		System:   webSystemPrompt(workdir),
-		Adapter:  adapter,
-		Sandbox:  buildSandboxConfig(workdir, false),
+		Home:          home,
+		Workdir:       workdir,
+		Provider:      provider,
+		Model:         model,
+		Reason:        llm.EffortHigh,
+		System:        webSystemPrompt(workdir),
+		Adapter:       adapter,
+		Sandbox:       buildSandboxConfig(workdir, false),
+		ContextWindow: contextWindowFor(adapter, model),
+		Compaction:    &compaction.Config{Prune: &compaction.PruneDefaults},
 	})
 
 	addr := net.JoinHostPort(host, port)

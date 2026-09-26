@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"lidsh/internal/agent"
+	"lidsh/internal/compaction"
 	"lidsh/internal/goal"
 	"lidsh/internal/llm"
 	"lidsh/internal/sandbox"
@@ -120,11 +122,19 @@ func runHeadlessCore(ctx context.Context, home, workdir, provider, model, prompt
 		Sess:     sess,
 		Resolver: agent.NewStaticResolver(map[string]llm.Adapter{provider: adapter}),
 		Tools:    reg, Provider: provider, Model: model,
-		Reason:  llm.EffortHigh,
-		System:  goalGuidanceHeadless(headlessSystemPrompt(workdir), goal.DefaultBlockedAfter),
-		CWD:     workdir,
-		Sandbox: sb,
+		Reason:        llm.EffortHigh,
+		System:        goalGuidanceHeadless(headlessSystemPrompt(workdir), goal.DefaultBlockedAfter),
+		CWD:           workdir,
+		Sandbox:       sb,
+		ContextWindow: contextWindowFor(adapter, model),
 	})
+	if eng, err := compaction.NewEngine(a, compaction.Config{
+		Prune: &compaction.PruneDefaults,
+	}); err == nil {
+		a.Compaction = eng
+	} else {
+		log.Printf("headless: compaction disabled: %v", err)
+	}
 	host := &headlessHost{a: a}
 	drv := goal.NewDriver(goalSvc, host)
 	host.drv = drv
@@ -193,6 +203,16 @@ func headlessSystemPrompt(workdir string) string {
 	return fmt.Sprintf("You are lidsh, a coding agent. Work in directory %s. "+
 		"You have shell and file tools; use them, then give a final answer. "+
 		"Be concise and show relevant output.", workdir)
+}
+
+// contextWindowFor 从 adapter 目录解析模型容量（0=未知）。
+func contextWindowFor(adapter llm.Adapter, model string) int {
+	for _, m := range adapter.Info().Models {
+		if m.ID == model {
+			return m.ContextWindow
+		}
+	}
+	return 0
 }
 
 // goalGuidanceHeadless 并入 goal policy section（systemPrompt.section 对应物）。

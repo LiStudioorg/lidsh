@@ -81,6 +81,10 @@ type MessageSource struct {
 	GoalID   string `json:"goalId,omitempty"`
 	Revision int    `json:"revision,omitempty"`
 	Round    int    `json:"round,omitempty"`
+	// kind=plugin 的 compaction checkpoint 归因（dsh-compaction/checkpoint）：
+	// {kind:'plugin', plugin:'compact', compactionId, sourceCommandId?}。
+	CompactionID    string `json:"compactionId,omitempty"`
+	SourceCommandID string `json:"sourceCommandId,omitempty"`
 }
 
 // Message 是一条会话消息（message.d.ts:120-129）。

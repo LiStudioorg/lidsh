@@ -52,6 +52,14 @@ func (s *Session) Len() int { return len(s.log) }
 // Surface 返回当前 surface 节点。
 func (s *Session) Surface() []SurfaceNode { return s.surface }
 
+// EventAt 按 seq（= 日志下标）取事件；越界返回 nil。
+func (s *Session) EventAt(seq int) *Event {
+	if seq < 0 || seq >= len(s.log) {
+		return nil
+	}
+	return s.log[seq]
+}
+
 // DeriveMessages 对 live surface 折 deriveEventMessage 得到请求 messages
 // （Session.deriveMessages：surface 是唯一 LLM 可见投影）。
 func (s *Session) DeriveMessages() []llm.Message {

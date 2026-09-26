@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"lidsh/internal/compaction"
 	"lidsh/internal/llm"
 	"lidsh/internal/session"
 	"lidsh/internal/tools"
@@ -34,6 +35,10 @@ type Agent struct {
 	Model    string
 	Reason   llm.ReasoningEffort
 
+	// ContextWindow 是模型容量（compaction 压力换算用；0=未知 → 自动压缩
+	// 对该 target warn-once 后放行，DSH TargetPressureConfigError 面）。
+	ContextWindow int
+
 	// System 是 system prompt 文本（surface node 0 system/message 的来源）。
 	System string
 
@@ -42,6 +47,9 @@ type Agent struct {
 
 	// Sandbox 是沙箱 standing 配置（M2；nil=未挂载）。
 	Sandbox *tools.SandboxOptions
+
+	// Compaction 是压缩引擎（nil=未挂载；auto pressure + overflow 恢复）。
+	Compaction *compaction.Engine
 
 	Signal context.Context
 
@@ -57,6 +65,10 @@ type Agent struct {
 	phase   Phase
 	sig     context.CancelFunc
 	started bool
+
+	// overflowRetries 是当前 agent 生命周期的 context-overflow 恢复计数
+	// （DSH：agent idle 或新 assistant/message 到达时清零）。
+	overflowRetries int
 }
 
 // Options 是 New 的输入。
@@ -69,6 +81,10 @@ type Options struct {
 	Reason   llm.ReasoningEffort
 	System   string
 	CWD      string
+	// ContextWindow 是模型容量（0=未知）。
+	ContextWindow int
+	// Compaction 是压缩引擎（nil=未挂载）。
+	Compaction *compaction.Engine
 	// Sandbox 是挂载沙箱组合的 standing 配置（M2）；nil=未挂载
 	// confinement executor（工具不感知沙箱，提权字段不 advertise）。
 	Sandbox *tools.SandboxOptions
@@ -81,6 +97,7 @@ func New(opts Options) *Agent {
 		Sess: opts.Sess, Resolver: opts.Resolver, Tools: opts.Tools,
 		Provider: opts.Provider, Model: opts.Model, Reason: opts.Reason,
 		System: opts.System, CWD: opts.CWD,
+		ContextWindow: opts.ContextWindow, Compaction: opts.Compaction,
 		Sandbox: opts.Sandbox,
 		Signal:  sig, sig: cancel,
 	}
@@ -187,6 +204,9 @@ func (a *Agent) turn(q *inbox) *Result {
 			return &Result{Kind: "aborted", Err: err}
 		}
 
+		// agent/pre-step 压力压缩（auto）：失败只 warn 后继续 turn。
+		a.pressureCheck()
+
 		stepEnd := a.step()
 		if stepEnd != nil {
 			stops = stepEnd
@@ -199,6 +219,7 @@ func (a *Agent) turn(q *inbox) *Result {
 		endReason = session.TurnEndReason{Kind: "completed"}
 	}
 	a.appendTurnEnd(turn, endReason)
+	a.overflowRetries = 0 // DSH：agent idle 清零 overflow 重试计数
 	return stops
 }
 
@@ -257,6 +278,11 @@ func (a *Agent) step() *Result {
 			f = &llm.Failure{Message: "model stream error", Code: llm.ErrUnknown}
 		}
 		a.appendAttempt(turn, acc)
+		// agent/request-error 的 context-overflow 分支：最大幅度收缩成功且
+		// surface 前进 → 本步 retry（DSH {kind:'retry'}）。
+		if f.Code == llm.ErrContextWindowExceeded && a.overflowRecover() {
+			return nil
+		}
 		return a.stepErr(turn, *f)
 	case llm.FinishAborted:
 		if len(blocks) > 0 && (flattenText(blocks) != "" || hasToolCalls(blocks)) {
@@ -300,6 +326,7 @@ func (a *Agent) appendAssistant(turn int, blocks []llm.ContentBlock, acc *sessio
 		return
 	}
 	msg := frameAssistantMessage(a.Provider, a.Model, blocks)
+	a.overflowRetries = 0 // DSH：新 durable assistant/message 到达清零计数
 	_, _ = a.Sess.Append(session.EventAssistantMessage,
 		session.AssistantMessageData{Turn: turn, Step: a.phase.Step, Message: msg,
 			Stream: acc.Items(), Usage: usage, Interrupted: interrupted},

@@ -128,14 +128,16 @@ func (s *Server) newPersisted(id string, sess *session.Session, hdr session.Head
 		Resolver: agent.NewStaticResolver(map[string]llm.Adapter{
 			s.Opts.Provider: s.Opts.Adapter,
 		}),
-		Tools:    s.Tools,
-		Provider: s.Opts.Provider,
-		Model:    s.Opts.Model,
-		Reason:   s.Opts.Reason,
-		System:   system,
-		CWD:      sess.Header.CWD,
-		Sandbox:  s.Opts.Sandbox,
+		Tools:         s.Tools,
+		Provider:      s.Opts.Provider,
+		Model:         s.Opts.Model,
+		Reason:        s.Opts.Reason,
+		System:        system,
+		CWD:           sess.Header.CWD,
+		Sandbox:       s.Opts.Sandbox,
+		ContextWindow: s.Opts.ContextWindow,
 	}
+	ent.compactionCfg = s.Opts.Compaction
 	return ent, nil
 }
 

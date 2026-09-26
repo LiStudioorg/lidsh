@@ -76,6 +76,14 @@ func NewOpenAI(cfg OpenAIConfig) *OpenAIAdapter {
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = "lidsh/0.1.0"
 	}
+	if len(cfg.Models) == 0 && cfg.SupportsThinking {
+		// DeepSeek 形态的默认目录（dsh-llm-deepseek DEFAULT_MODELS 的收缩面：
+		// DEFAULT_CONTEXT_WINDOW = 1e6）。
+		cfg.Models = []Model{
+			{ID: "deepseek-chat", Name: "DeepSeek Chat", ContextWindow: 1_000_000, SupportsTools: true},
+			{ID: "deepseek-reasoner", Name: "DeepSeek Reasoner", ContextWindow: 1_000_000, SupportsTools: true},
+		}
+	}
 	return &OpenAIAdapter{cfg: cfg}
 }
 
