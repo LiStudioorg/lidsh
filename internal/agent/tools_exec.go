@@ -55,14 +55,16 @@ func (a *Agent) runTool(turn, step int, blk llm.ContentBlock) (*tools.Result, *l
 	callSeq := callEv.Seq
 
 	call := tools.ToolCall{CallID: blk.ID, RootCallID: blk.ID, Name: blk.Name, Arguments: args}
-	ec := &tools.ExecContext{Signal: a.Signal, AgentCWD: a.CWD, CWD: a.CWD}
+	ec := &tools.ExecContext{Signal: a.Signal, AgentCWD: a.CWD, CWD: a.CWD, Ctx: a.toolCtx}
 	// M2：挂载沙箱组合时，每次调用派生 SandboxContext（§6.3 载荷含 callId/agent）。
 	if a.Sandbox != nil {
 		ec.Sandbox = a.Sandbox.Context(a.Sess.Header.ID, blk.ID)
 	}
 	tr, err := a.Tools.Execute(call, ec)
 	if err != nil {
-		// registry 层异常：合成 isError 失败结果。
+		// registry 层异常：合成 isError 失败结果（码透传，goal 工具需要
+		// GOAL_TOOL_* / GOAL_* 码面）。
+		code := tools.ErrorCode(err)
 		text := fmt.Sprintf("Error: %v", err)
 		msg := frameToolResultMessage(blk.ID, text, true)
 		_, _ = a.Sess.Append(session.EventToolResult,
@@ -70,7 +72,7 @@ func (a *Agent) runTool(turn, step int, blk llm.ContentBlock) (*tools.Result, *l
 				Error: &struct {
 					Name string `json:"name"`
 					Code string `json:"code"`
-				}{Name: "Error", Code: "UNKNOWN"}},
+				}{Name: "ToolError", Code: code}},
 			session.AppendOp(), []int{callSeq})
 		return nil, nil
 	}
@@ -80,7 +82,30 @@ func (a *Agent) runTool(turn, step int, blk llm.ContentBlock) (*tools.Result, *l
 		session.ToolResultData{Turn: turn, Step: step, Message: msg,
 			Error: toolError(tr)},
 		session.AppendOp(), []int{callSeq})
+	// deferContext 对应物：goal §7.3 收尾 notice 经 plugin form=notice 回注
+	// （下一步生效；框架化文本是生产者责任）。
+	for _, inj := range tr.AdditionalContexts {
+		a.queueContextNotice(turn, step, inj)
+	}
 	return tr, nil
+}
+
+// queueContextNotice 把一条回注上下文落成 plugin notice 消息（非 surface
+// 通道走 tool/result 之外的 user/message 面：DSH deferContext 生成
+// createUserMessage(source kind=plugin form=notice)）。
+func (a *Agent) queueContextNotice(turn, step int, inj tools.ContextInjection) {
+	plugin := inj.Plugin
+	if plugin == "" {
+		plugin = "tools"
+	}
+	msg := &llm.Message{
+		ID:      session.NewMessageID(),
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: inj.Text}},
+		Source: llm.MessageSource{Kind: "plugin", Plugin: plugin,
+			Form: "notice", Summary: inj.Summary},
+	}
+	_, _ = a.Sess.Append(session.EventUserMessage, *msg, session.AppendOp(), nil)
 }
 
 func toolError(tr *tools.Result) *struct {

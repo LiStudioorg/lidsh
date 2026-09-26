@@ -45,6 +45,15 @@ type Agent struct {
 
 	Signal context.Context
 
+	// toolCtx 是本 turn 的调用方权威快照（direct-human / goal-round），
+	// 每次 Prompt/GoalRoundPrompt 前写入，工具执行时复制进 ExecContext。
+	toolCtx *tools.ToolContext
+
+	// GoalGate 是 pre-step 竞态闸门（dsh-goal-round-driver 的 agent/pre-step
+	// waterfall 对应物）：inbox 队首是 goal-sourced 消息时，turn 先问闸门。
+	// 返回 reject=true → 本条消息退回（不落盘），turn 以 blocked 收束。
+	GoalGate func(msg *llm.Message) (reject bool)
+
 	phase   Phase
 	sig     context.CancelFunc
 	started bool
@@ -80,7 +89,7 @@ func New(opts Options) *Agent {
 // Cancel 取消当前 turn（cancel RPC 对应物；取消失效后可再 Prompt）。
 func (a *Agent) Cancel() { a.sig() }
 
-// Prompt 把用户输入送入并驱动 agent 直到回复完成。
+// Prompt 把用户输入送入并驱动 agent 直到回复完成（direct-human 权威 turn）。
 func (a *Agent) Prompt(content, mode string) (*Result, error) {
 	if mode == "" {
 		mode = "followup"
@@ -88,7 +97,28 @@ func (a *Agent) Prompt(content, mode string) (*Result, error) {
 	if mode != "followup" && mode != "steer" {
 		return nil, fmt.Errorf("agent: unknown prompt mode %q", mode)
 	}
+	msg := *createUserMessage(content)
+	return a.promptMessages([]llm.Message{msg}, &tools.ToolContext{DirectHuman: true})
+}
 
+// GoalRoundPrompt 注入一个 goal 续轮 turn（driver §7.4 步骤 4：
+// followup(createUserMessage({content: renderGoalRoundPrompt(goal, round),
+// source:{kind:'goal', goalId, revision, round}}))）。goal 归因 turn 的
+// 权威 = goal-round（complete/blocked 模型通道）。
+func (a *Agent) GoalRoundPrompt(content string, src *tools.GoalRoundSource) (*Result, error) {
+	msg := llm.Message{
+		ID:      session.NewMessageID(),
+		Role:    llm.RoleUser,
+		Content: []llm.ContentBlock{{Type: "text", Text: content}},
+		Source: llm.MessageSource{Kind: "goal",
+			GoalID: src.GoalID, Revision: src.Revision, Round: src.Round},
+	}
+	return a.promptMessages([]llm.Message{msg}, &tools.ToolContext{GoalRound: src})
+}
+
+// promptMessages 是 turn 的统一入口：一次调用 = 一个 turn，
+// inbox 只含本批消息。
+func (a *Agent) promptMessages(msgs []llm.Message, tc *tools.ToolContext) (*Result, error) {
 	if !a.started {
 		// 首轮：注入 system prompt（surface node 0 的 system/message）。
 		if a.System != "" {
@@ -102,17 +132,22 @@ func (a *Agent) Prompt(content, mode string) (*Result, error) {
 		a.started = true
 	}
 
-	// 一次 Prompt = 一个 turn（headless 单发；inbox 只含本条消息）。
 	resetCtx, cancel := context.WithCancel(context.Background())
 	a.sig = cancel
 	a.Signal = resetCtx
-	inbox := &inbox{items: []inboxItem{{content: content}}}
-
-	return a.turn(inbox), nil
+	if tc != nil {
+		tc.SessionID = a.Sess.Header.ID
+	}
+	a.toolCtx = tc
+	items := make([]inboxItem, 0, len(msgs))
+	for _, m := range msgs {
+		items = append(items, inboxItem{msg: m})
+	}
+	return a.turn(&inbox{items: items}), nil
 }
 
 // turn 复刻 turn()（index.js:919-1007）。
-func (a *Agent) turn(inbox *inbox) *Result {
+func (a *Agent) turn(q *inbox) *Result {
 	a.phase.Turn++
 	a.phase.Step = 0
 	turn := a.phase.Turn
@@ -121,10 +156,23 @@ func (a *Agent) turn(inbox *inbox) *Result {
 		return &Result{Kind: "error", Err: err}
 	}
 
-	// 首轮把用户消息落 user/message（surface）。
-	if msg := inbox.claim(); msg != "" {
+	// 首轮把输入落 user/message（surface）。goal-sourced 消息先过 pre-step
+	// 竞态闸门（§7.4）：闸门 reject → 消息标 stale 后整批退回（不落盘）、
+	// turn 以 blocked 收束（"claimed 消息不落日志，turn 以 {kind:'blocked'}
+	// 结束；driver fence 3 → disarm"）。
+	if msg := q.claim(); msg != nil {
+		if msg.Source.Kind == "goal" && a.GoalGate != nil {
+			if reject := a.GoalGate(msg); reject {
+				// driver fence 3：claimed 消息不落日志、整条退回队列
+				// （restoreOtherClaimed 语义），turn 以 blocked 收束。
+				q.items = append([]inboxItem{{msg: *msg}}, q.items...)
+				blocked := session.TurnEndReason{Kind: "blocked"}
+				a.appendTurnEnd(turn, blocked)
+				return &Result{Kind: "blocked", Reason: blocked}
+			}
+		}
 		if _, err := a.Sess.Append(session.EventUserMessage,
-			*createUserMessage(msg), session.AppendOp(), nil); err != nil {
+			*msg, session.AppendOp(), nil); err != nil {
 			return &Result{Kind: "error", Err: err}
 		}
 	}

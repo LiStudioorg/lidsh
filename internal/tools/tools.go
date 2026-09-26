@@ -12,6 +12,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -50,6 +51,9 @@ type ExecContext struct {
 	// Sandbox 是本次调用的沙箱上下文；nil=未挂载 confinement executor
 	// （工具不感知沙箱，提权字段也不 advertise，bash-sandbox.md §6.1）。
 	Sandbox *SandboxContext
+	// Ctx 是本 turn 的调用方权威快照（direct-human / goal-round）；nil=无
+	// calling agent 权威（goal 类工具 fail-closed 拒绝）。
+	Ctx *ToolContext
 }
 
 // SandboxContext 是挂载了沙箱的组合里，每次工具调用携带的沙箱裁决输入。
@@ -93,9 +97,36 @@ type Result struct {
 	IsError bool
 	Meta    map[string]any
 
-	// AdditionalContexts 回注上下文（进 next-step 队列，下一步生效）
-	AdditionalContexts []string
+	// AdditionalContexts 回注上下文（进 next-step 队列，下一步生效；
+	// deferContext 对应物，goal §7.3 收尾 notice 走此通道）。
+	AdditionalContexts []ContextInjection
 	ConcludesTurn      bool
+}
+
+// ContextInjection 是一条回注上下文（source{kind:plugin,plugin,form:notice,
+// summary} + 正文）。
+type ContextInjection struct {
+	Text    string
+	Plugin  string // 缺省 "tools"
+	Summary string // notice 必填（≤120 字符）
+}
+
+// ToolError 是带稳定码的工具执行错误（HarnessError 对应物）。Execute 返回
+// 它时，tool/result 事件的 error.code 用其码而非 UNKNOWN。
+type ToolError struct {
+	Code string
+	Msg  string
+}
+
+func (e *ToolError) Error() string { return e.Msg }
+
+// ErrorCode 提取错误码（errors.As 语义，无码返回 "UNKNOWN"）。
+func ErrorCode(err error) string {
+	var te *ToolError
+	if errors.As(err, &te) && te.Code != "" {
+		return te.Code
+	}
+	return "UNKNOWN"
 }
 
 // ToolCall 是一次工具调用。
@@ -228,4 +259,34 @@ func parseArguments(raw string) (map[string]any, error) {
 		return map[string]any{}, nil
 	}
 	return m, nil
+}
+
+// Names 返回已注册工具名（fresh child 复制工具集用，M2 ralph）。
+func (r *Registry) Names() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.tools))
+	for n := range r.tools {
+		out = append(out, n)
+	}
+	return out
+}
+
+// Copy 浅拷贝注册表（fresh child 在副本上增删，父注册表不受影响）。
+func (r *Registry) Copy() *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := NewRegistry()
+	for n, t := range r.tools {
+		reg := *t
+		out.tools[n] = &reg
+	}
+	return out
+}
+
+// Drop 注销一个工具（child 工具集收缩用）。
+func (r *Registry) Drop(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.tools, name)
 }

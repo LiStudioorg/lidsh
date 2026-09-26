@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"lidsh/internal/agent"
+	"lidsh/internal/goal"
 	"lidsh/internal/llm"
 	"lidsh/internal/sandbox"
 	"lidsh/internal/session"
@@ -63,9 +64,142 @@ type Server struct {
 type entry struct {
 	sess  *session.Session
 	agent *agent.Agent
+	// agentOpts 是惰性构造参数（runPrompt/RunRound 共用；M2 goal 续轮可能
+	// 先于首个人工 prompt 需要 agent）。
+	agentOpts agent.Options
 	// 持久化写路径：会话目录、写锁、增量日志（M1b 接回 M1a 的 JSONL+zstd）。
 	dir string
 	lw  *session.LogWriter
+
+	// goal 装配（M2-2）。
+	goalSvc *goal.Service
+	goalDrv *goal.Driver
+
+	// busyMu 护 entry 本地状态：busy = 有在途 turn（driver IdleAndLive 谓词）。
+	busyMu   sync.Mutex
+	busy     bool
+	goalTurn bool
+	queued   []string // busy 时排队的人工输入（competing input 优先于续轮）
+}
+
+// ensureAgent 惰性构造共享 agent（跨 turn 复用；surface 已含历史）。
+func (e *entry) ensureAgent() *agent.Agent {
+	e.busyMu.Lock()
+	defer e.busyMu.Unlock()
+	if e.agent == nil {
+		e.agent = agent.New(e.agentOpts)
+		if e.goalDrv != nil {
+			gd := e.goalDrv
+			e.agent.GoalGate = func(msg *llm.Message) bool {
+				return !gd.GateCheck(msg.Source.GoalID, msg.Source.Revision, msg.Source.Round)
+			}
+		}
+	}
+	return e.agent
+}
+
+// StartHuman 提交一次人工 prompt（direct-human 权威）。busy 时排队
+// （competing input：人工输入优先于 goal 续轮）。返回是否立即开始。
+func (e *entry) StartHuman(text string) bool {
+	e.busyMu.Lock()
+	if e.busy {
+		e.queued = append(e.queued, text)
+		e.busyMu.Unlock()
+		return false
+	}
+	e.busy = true
+	e.busyMu.Unlock()
+	go func() {
+		res, err := e.ensureAgent().Prompt(text, "followup")
+		e.finishTurn(turnKind(res, err))
+	}()
+	return true
+}
+
+// Cancel 取消在途 turn（session/cancel 对应物）。
+func (e *entry) Cancel() {
+	e.busyMu.Lock()
+	a := e.agent
+	e.busyMu.Unlock()
+	if a != nil {
+		a.Cancel()
+	}
+}
+
+// finishTurn 清 busy、回收排队输入，并把 idle 信号交给 goal driver
+// （agent/status=idle + turn/end 的合并面）。
+func (e *entry) finishTurn(kind string) {
+	e.busyMu.Lock()
+	goalTurn := e.goalTurn
+	e.goalTurn = false
+	e.busy = false
+	var human string
+	if len(e.queued) > 0 {
+		human = e.queued[0]
+		e.queued = e.queued[1:]
+		if human != "" {
+			e.busy = true // 排队人工输入立即占位（先于续轮评估）
+		}
+	}
+	d := e.goalDrv
+	a := e.agent
+	e.busyMu.Unlock()
+
+	if d != nil {
+		d.OnTurnEnd(goalTurn, kind)
+	}
+	if human != "" && a != nil {
+		go func() {
+			res, err := a.Prompt(human, "followup")
+			e.finishTurn(turnKind(res, err))
+		}()
+	}
+}
+
+// errAgentNotReady 触发 driver 的 queue-failed block 路径。
+var errAgentNotReady = &agentNotReadyError{}
+
+type agentNotReadyError struct{}
+
+func (*agentNotReadyError) Error() string { return "agent is busy or not constructible" }
+
+// turnKind 归一收束 kind（max-tokens 等驱动 fence 需要）。
+func turnKind(res *agent.Result, err error) string {
+	if res != nil && res.Kind != "" {
+		return res.Kind
+	}
+	if err != nil {
+		return "error"
+	}
+	return "completed"
+}
+
+// ---- goal.RoundHost ----
+
+// IdleAndLive：agent 可构造且当前无在途 turn。
+func (e *entry) IdleAndLive() bool {
+	e.busyMu.Lock()
+	defer e.busyMu.Unlock()
+	return !e.busy && e.sess != nil
+}
+
+// RunRound 启动一个 goal 续轮 turn（异步；完成经 finishTurn 回灌驱动）。
+func (e *entry) RunRound(content string, src *tools.GoalRoundSource) error {
+	e.busyMu.Lock()
+	if e.busy || e.sess == nil {
+		e.busyMu.Unlock()
+		return errAgentNotReady
+	}
+	e.busy = true
+	e.goalTurn = true
+	e.busyMu.Unlock()
+
+	a := e.ensureAgent()
+	go func() {
+		res, err := a.GoalRoundPrompt(content, src)
+		e.finishTurn(turnKind(res, err))
+	}()
+	return nil
 }
 
 // New 构造服务器。
@@ -88,6 +222,9 @@ func New(opts Options) *Server {
 		hub:        newHub(),
 		waterfalls: map[string]*waterfall{},
 	}
+	// M2-2：goal 三工具（provider 按会话解析）+ 固定 ralph 循环工具。
+	goal.RegisterGoalTools(reg, s.goalProvider)
+	s.registerRalph(reg)
 	// 沙箱挂载时绑定瀑布审批通道（浏览器经 $events/result 回环应答，§6.5）。
 	if s.Opts.Sandbox != nil && s.Opts.Sandbox.Approver == nil {
 		s.Opts.Sandbox.Approver = &waterfallApprover{s}

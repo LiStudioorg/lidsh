@@ -21,8 +21,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"lidsh/internal/agent"
+	"lidsh/internal/goal"
 	"lidsh/internal/llm"
 	"lidsh/internal/sandbox"
 	"lidsh/internal/session"
@@ -101,20 +104,55 @@ func runHeadlessCore(ctx context.Context, home, workdir, provider, model, prompt
 	}
 	tools.RegisterFSTools(reg)
 
+	// goal：服务 + 三工具 + 续轮驱动（headless 宿主：busy 标志 + idle 钩子）。
+	goalSvc, err := goal.NewService(sess, goal.DefaultBlockedAfter, goal.DefaultMaxGoalRounds)
+	if err != nil {
+		return fmt.Errorf("headless: goal fold: %w", err)
+	}
+	goal.RegisterGoalTools(reg, func(ec *tools.ExecContext) *goal.Service {
+		if ec == nil || ec.Ctx == nil || ec.Ctx.SessionID != string(sess.Header.ID) {
+			return nil
+		}
+		return goalSvc
+	})
+
 	a := agent.New(agent.Options{
 		Sess:     sess,
 		Resolver: agent.NewStaticResolver(map[string]llm.Adapter{provider: adapter}),
 		Tools:    reg, Provider: provider, Model: model,
 		Reason:  llm.EffortHigh,
-		System:  headlessSystemPrompt(workdir),
+		System:  goalGuidanceHeadless(headlessSystemPrompt(workdir), goal.DefaultBlockedAfter),
 		CWD:     workdir,
 		Sandbox: sb,
 	})
+	host := &headlessHost{a: a}
+	drv := goal.NewDriver(goalSvc, host)
+	host.drv = drv
+	defer drv.Stop()
+	a.GoalGate = func(msg *llm.Message) bool {
+		return !drv.GateCheck(msg.Source.GoalID, msg.Source.Revision, msg.Source.Round)
+	}
+	// durable admitted 面：goal 消息落盘 → 镜像推进。
+	sess.OnEvent(func(e *session.Event) {
+		if e.Type != session.EventUserMessage {
+			return
+		}
+		var m llm.Message
+		if json.Unmarshal(e.Data, &m) != nil || m.Source.Kind != "goal" {
+			return
+		}
+		goalSvc.AdmitRound(m.Source.GoalID, m.Source.Revision, m.Source.Round)
+	})
 
+	// 人工 turn（direct human 权威）。
 	res, err := a.Prompt(prompt, "followup")
+	host.turnDone(res, err)
 	if err != nil {
 		return fmt.Errorf("headless: %v", err)
 	}
+	// goal 续轮：goal/change 与 idle 都经 drv.RequestDrive（svc 已接线）。
+	// 等驱动排空（无在途 turn、无预约、非 running）后继续收尾。
+	host.drain(drv)
 	if res.Kind == "aborted" {
 		return fmt.Errorf("headless: aborted: %v", res.Err)
 	}
@@ -155,6 +193,73 @@ func headlessSystemPrompt(workdir string) string {
 	return fmt.Sprintf("You are lidsh, a coding agent. Work in directory %s. "+
 		"You have shell and file tools; use them, then give a final answer. "+
 		"Be concise and show relevant output.", workdir)
+}
+
+// goalGuidanceHeadless 并入 goal policy section（systemPrompt.section 对应物）。
+func goalGuidanceHeadless(base string, blockedAfter int) string {
+	return base + "\n\n" + goal.Guidance(blockedAfter)
+}
+
+// headlessHost 是 goal driver 的单 agent 宿主（busy 标志 + idle 回灌）。
+type headlessHost struct {
+	a        *agent.Agent
+	drv      *goal.Driver
+	mu       sync.Mutex
+	busy     bool
+	goalTurn bool
+}
+
+func (h *headlessHost) IdleAndLive() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.busy
+}
+
+func (h *headlessHost) RunRound(content string, src *tools.GoalRoundSource) error {
+	h.mu.Lock()
+	if h.busy {
+		h.mu.Unlock()
+		return fmt.Errorf("headless host is busy")
+	}
+	h.busy = true
+	h.goalTurn = true
+	h.mu.Unlock()
+	go func() {
+		res, err := h.a.GoalRoundPrompt(content, src)
+		h.turnDone(res, err)
+	}()
+	return nil
+}
+
+// turnDone 是 idle 钩子（agent/status=idle + turn/end 合并面）。
+func (h *headlessHost) turnDone(res *agent.Result, err error) {
+	kind := "completed"
+	if res != nil && res.Kind != "" {
+		kind = res.Kind
+	} else if err != nil {
+		kind = "error"
+	}
+	h.mu.Lock()
+	h.busy = false
+	goalTurn := h.goalTurn
+	h.goalTurn = false
+	h.mu.Unlock()
+	if h.drv != nil {
+		h.drv.OnTurnEnd(goalTurn, kind)
+	}
+}
+
+// drain 等 goal 续轮排空：宿主空闲且驱动静默（无请求/无在飞/无预约）。
+func (h *headlessHost) drain(drv *goal.Driver) {
+	for {
+		h.mu.Lock()
+		busy := h.busy
+		h.mu.Unlock()
+		if !busy && drv.Quiet() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // parseHeadlessPrompt：args 里第一个非 flag token 是提示词；无则读 stdin 全文。

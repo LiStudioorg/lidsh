@@ -76,6 +76,11 @@ type MessageSource struct {
 	// kind=plugin 的 ContextForm 标签
 	Form    string `json:"form,omitempty"`    // instructions|catalog|snapshot|notice|relay|recall
 	Summary string `json:"summary,omitempty"` // notice 必填，≤120 字符
+	// kind=goal（GoalMessageSource，goal domain.d.ts:34-40）：goal 续轮归因，
+	// fold 校验 round===roundsStarted+1 且 ≤ maxGoalRounds。
+	GoalID   string `json:"goalId,omitempty"`
+	Revision int    `json:"revision,omitempty"`
+	Round    int    `json:"round,omitempty"`
 }
 
 // Message 是一条会话消息（message.d.ts:120-129）。

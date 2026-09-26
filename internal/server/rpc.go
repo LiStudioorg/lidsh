@@ -76,6 +76,11 @@ func (s *Server) rpcSessionCreate(rpcID string, req protocolRPCRequest) protocol
 		s.emitEvent(id, e)
 	})
 
+	// goal 装配：服务（fold 重建）+ 续轮驱动 + activation 广播面。
+	if err := s.mountGoal(ent); err != nil {
+		return rpcFailResult(rpcID, "session/corrupt", err.Error())
+	}
+
 	s.mu.Lock()
 	s.sessions[id] = ent
 	s.mu.Unlock()
@@ -114,8 +119,28 @@ func (s *Server) newPersisted(id string, sess *session.Session, hdr session.Head
 	}
 	// 事件落盘：OnEvent 里先写盘再广播（调用方再挂广播 handler，二者各自独立）。
 	sess.OnEvent(func(e *session.Event) { _ = lw.AppendEvent(e) })
-	return &entry{sess: sess, dir: dir, lw: lw}, nil
+	ent := &entry{sess: sess, dir: dir, lw: lw}
+	// 惰性 agent 参数（system = 基座 + goal/ralph policy sections，
+	// systemPrompt.section 的拼接面对应物）。
+	system := goalGuidance(s.Opts.System, goalDefaultBlockedAfter) + "\n\n" + ralphGuidanceSection()
+	ent.agentOpts = agent.Options{
+		Sess: sess,
+		Resolver: agent.NewStaticResolver(map[string]llm.Adapter{
+			s.Opts.Provider: s.Opts.Adapter,
+		}),
+		Tools:    s.Tools,
+		Provider: s.Opts.Provider,
+		Model:    s.Opts.Model,
+		Reason:   s.Opts.Reason,
+		System:   system,
+		CWD:      sess.Header.CWD,
+		Sandbox:  s.Opts.Sandbox,
+	}
+	return ent, nil
 }
+
+// goalDefaultBlockedAfter 是 goal 工具的 blockedAfterConsecutiveRounds。
+const goalDefaultBlockedAfter = 3
 
 // ---- session/prompt ----
 
@@ -178,42 +203,28 @@ func (s *Server) rpcSessionPrompt(rpcID string, req protocolRPCRequest) protocol
 	}
 
 	// 后台跑 agent；返回 accepted:true（§5.2 session/prompt 结果是 {accepted}）。
-	go s.runPrompt(ent, text)
+	ent.StartHuman(text)
 	return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
 		Result: protocolRPCResult{Ok: bptr(true), Value: mustRaw(map[string]any{"accepted": true})}}
-}
-
-// runPrompt 在后台驱动一次 agent 对话。同一会话的 agent 惰性构造一次并跨
-// Prompt 复用（第二次 Prompt 在同会话上继续，surface 已含历史）。
-func (s *Server) runPrompt(ent *entry, text string) {
-	s.mu.Lock()
-	if ent.agent == nil {
-		ent.agent = agent.New(agent.Options{
-			Sess: ent.sess,
-			Resolver: agent.NewStaticResolver(map[string]llm.Adapter{
-				s.Opts.Provider: s.Opts.Adapter,
-			}),
-			Tools:    s.Tools,
-			Provider: s.Opts.Provider,
-			Model:    s.Opts.Model,
-			Reason:   s.Opts.Reason,
-			System:   s.Opts.System,
-			CWD:      ent.sess.Header.CWD,
-			Sandbox:  s.Opts.Sandbox,
-		})
-	}
-	a := ent.agent
-	// 事件经 OnEvent 广播给所有 follow 连接（见 follow.go 订阅）。
-	s.mu.Unlock()
-
-	// 取消旧的会话级 context 并新建（复用 Prompt 内部的自带 context）。
-	_, _ = a.Prompt(text, "followup")
 }
 
 // ---- session/cancel ----
 
 func (s *Server) rpcSessionCancel(rpcID string, req protocolRPCRequest) protocolRPCResponse {
-	// M1b：cancel 空操作（agent 无跨调用取消句柄），返回 accepted。
+	var p protocolRPCPayload
+	if err := json.Unmarshal(req.Payload, &p); err != nil {
+		return rpcFailResult(rpcID, "gateway/bad-request", err.Error())
+	}
+	var a struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.Unmarshal(p.Args, &a)
+	s.mu.Lock()
+	ent := s.sessions[a.SessionID]
+	s.mu.Unlock()
+	if ent != nil {
+		ent.Cancel()
+	}
 	return protocolRPCResponse{Type: "server-response", RPCID: rpcID,
 		Result: protocolRPCResult{Ok: bptr(true), Value: mustRaw(map[string]any{"accepted": true})}}
 }
